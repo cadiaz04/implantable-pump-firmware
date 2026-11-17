@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>BioPump Controller</title>
+<link rel="stylesheet" href="uplot.min.css">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%230f766e'/%3E%3Cpath d='M9 18c3-8 11-8 14 0' stroke='white' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <span class="title">BioPump</span>
+    <span id="simBadge" class="badge sim" hidden>SIM</span>
+  </div>
+  <div class="conn">
+    <span id="connDot" class="dot off" aria-hidden="true"></span>
+    <span id="connText">Connecting…</span>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" data-tab="dash" class="active">Dashboard</button>
+  <button role="tab" data-tab="cal">Calibrate</button>
+  <button role="tab" data-tab="pumps">Pumps</button>
+  <button role="tab" data-tab="settings">Settings</button>
+  <button role="tab" data-tab="data">Data</button>
+</nav>
+
+<div id="estopBanner" class="estop-banner" hidden>
+  <strong>E-STOP LATCHED</strong> — all motors stopped and driver outputs disabled.
+  <button id="estopReset" class="btn">Reset E-STOP</button>
+</div>
+
+<main>
+  <!-- ============================ DASHBOARD ============================ -->
+  <section id="tab-dash" class="tab active">
+    <div id="channels" class="channels"></div>
+    <details class="panel events-panel">
+      <summary>Event log <span id="eventCount" class="muted"></span></summary>
+      <ul id="eventList" class="events"></ul>
+    </details>
+  </section>
+
+  <!-- ============================ CALIBRATE ============================ -->
+  <section id="tab-cal" class="tab">
+    <div class="panel">
+      <div class="row wrap">
+        <label class="field">Channel
+          <select id="calCh"></select>
+        </label>
+        <div class="field grow">
+          <span class="label">Pump profile</span>
+          <div id="calProfile" class="strong">—</div>
+        </div>
+      </div>
+      <p class="hint" id="calHint">Prime the line and remove bubbles first. Calibration runs on the ESP32, so it keeps going if your phone locks.</p>
+    </div>
+
+    <div class="panel">
+      <h3>Sweep setup</h3>
+      <div class="grid3">
+        <label class="field">Min command <span class="unit" data-cal-unit></span><input id="calMin" type="number" step="any" value="0"></label>
+        <label class="field">Max command <span class="unit" data-cal-unit></span><input id="calMax" type="number" step="any"></label>
+        <label class="field">Points<input id="calPoints" type="number" min="2" max="20" value="10"></label>
+        <label class="field">Settle time (s)<input id="calSettle" type="number" min="0" value="60"></label>
+        <label class="field">Averaging time (s)<input id="calAvg" type="number" min="1" value="60"></label>
+        <label class="field">Repeats<input id="calRepeats" type="number" min="1" max="5" value="1"></label>
+      </div>
+      <label class="field">Command list (optional, comma-separated: overrides min/max/points)
+        <input id="calList" type="text" placeholder="e.g. 0, 1, 2, 4, 6, 8, 10">
+      </label>
+      <div class="row wrap checks">
+        <label><input id="calZero" type="checkbox" checked> Zero sensor first (pump stopped)</label>
+        <label><input id="calUpDown" type="checkbox"> Add descending pass (hysteresis)</label>
+        <label><input id="calKeep" type="checkbox" checked> Keep running if disconnected</label>
+        <label><input id="calReverse" type="checkbox"> Reverse direction</label>
+      </div>
+      <details>
+        <summary>Steady-state detection</summary>
+        <div class="grid3">
+          <label class="field">Window (s)<input id="calSsWin" type="number" value="20"></label>
+          <label class="field">Timeout (s)<input id="calSsTimeout" type="number" value="120"></label>
+          <label class="field">Max slope (%/min)<input id="calSsSlope" type="number" step="any" value="3"></label>
+          <label class="field">Max std dev (%)<input id="calSsStd" type="number" step="any" value="25"></label>
+          <label class="field">Std floor (µL/min)<input id="calSsStdFloor" type="number" step="any" value="20"></label>
+          <label class="field">Zero averaging (s)<input id="calZeroS" type="number" value="30"></label>
+        </div>
+      </details>
+      <div class="row">
+        <button id="calStart" class="btn primary">Start sweep</button>
+        <button id="calAbort" class="btn danger">Abort</button>
+        <span id="calEstimate" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>Progress</h3>
+      <div class="progress"><div id="calBar"></div></div>
+      <div id="calPhase" class="muted">No sweep data.</div>
+      <div class="plot-wrap"><div id="calPlot"></div></div>
+      <div class="table-wrap">
+        <table id="calTable" class="table">
+          <thead><tr><th>#</th><th class="num">Cmd</th><th>Pass</th><th>Status</th><th class="num">Sensor</th><th class="num">±SD</th><th class="num">Ref</th><th>Manual reference</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="hint">Manual reference: collect fluid on a balance (1 mg ≈ 1 µL water) or in a graduated cylinder over a timed interval while the pump runs at that command. It replaces the sensor value for the fit; both are kept.</p>
+    </div>
+
+    <div class="panel">
+      <h3>Fit</h3>
+      <div class="row wrap">
+        <div class="seg" id="fitSeg">
+          <button data-fit="linear" class="active">Linear</button>
+          <button data-fit="quadratic">Quadratic</button>
+          <button data-fit="lookup">Lookup</button>
+        </div>
+        <div id="fitStats" class="mono"></div>
+      </div>
+      <div class="plot-wrap"><div id="resPlot"></div></div>
+      <div class="grid3">
+        <label class="field">Calibration name<input id="calName" type="text" placeholder="e.g. water, 2 mm tubing"></label>
+        <label class="field">Tubing / setup note<input id="calNote" type="text"></label>
+      </div>
+      <div class="row wrap">
+        <button id="calAccept" class="btn primary">Accept &amp; save to profile</button>
+        <button id="calDiscard" class="btn">Discard data</button>
+        <button id="calExportCsv" class="btn">Export CSV</button>
+        <button id="calExportJson" class="btn">Export JSON</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ PUMPS ============================ -->
+  <section id="tab-pumps" class="tab">
+    <div class="panel">
+      <div class="row wrap">
+        <h3 class="grow">Pump profiles</h3>
+        <button id="pumpNew" class="btn primary">New</button>
+        <label class="btn">Import<input id="pumpImport" type="file" accept=".json,application/json" hidden></label>
+      </div>
+      <div id="pumpList" class="pump-list"></div>
+    </div>
+
+    <form id="pumpForm" class="panel" hidden>
+      <h3 id="pumpFormTitle">Edit profile</h3>
+      <div class="grid3">
+        <label class="field">Name<input name="name" required maxlength="63"></label>
+        <label class="field">Pump type
+          <select name="pumpType"><option>syringe</option><option>diaphragm</option><option>peristaltic</option><option>other</option></select>
+        </label>
+        <label class="field">Fluid
+          <select name="fluid"><option value="water">water</option><option value="saline">saline</option></select>
+        </label>
+      </div>
+      <label class="field">Notes<textarea name="notes" rows="2" maxlength="500"></textarea></label>
+
+      <h4>Motor</h4>
+      <div class="grid3">
+        <label class="field">Driver type
+          <select name="motor.driverType">
+            <option value="uln2003">ULN2003 (28BYJ-48 unipolar)</option>
+            <option value="stepdir">STEP/DIR (A4988/DRV8825/TMC2209)</option>
+            <option value="drv8871">DC: DRV8871 (IN1/IN2 PWM)</option>
+            <option value="pwmdir">DC: PWM + DIR (L298N/TB6612)</option>
+          </select>
+        </label>
+        <label class="field">Max command <span class="unit" data-motor-unit></span><input name="motor.maxCommand" type="number" step="any" required></label>
+        <label class="field">Min command <span class="unit" data-motor-unit></span><input name="motor.minCommand" type="number" step="any"></label>
+        <label class="field">Acceleration <span class="unit" data-motor-unit-s></span><input name="motor.accel" type="number" step="any"></label>
+        <label class="field stepper-only">Steps / motor rev<input name="motor.stepsPerRev" type="number" step="any"></label>
+        <label class="field stepper-only">Microstep<input name="motor.microstep" type="number" step="1"></label>
+        <label class="field stepper-only">Gear ratio (motor : shaft)<input name="motor.gearRatio" type="number" step="any"></label>
+        <label class="field dc-only">Min duty / deadband (%)<input name="motor.minDuty" type="number" step="any"></label>
+        <label class="field dc-only">Start kick (ms)<input name="motor.kickMs" type="number" step="1"></label>
+        <label class="field dc-only">Kick duty (%)<input name="motor.kickDuty" type="number" step="any"></label>
+        <label class="field dc-only">Decay mode
+          <select name="motor.decay"><option value="fast">fast (coast)</option><option value="slow">slow (brake)</option></select>
+        </label>
+      </div>
+      <div class="row wrap checks">
+        <label><input name="motor.invertDir" type="checkbox"> Invert direction</label>
+        <label class="stepper-only"><input name="motor.releaseWhenStopped" type="checkbox"> De-energise when stopped</label>
+      </div>
+      <p class="hint stepper-only">28BYJ-48: 4096 half-steps per output rev nominal (many are ≈4075.8 — calibration absorbs it). NEMA17: 200 full steps × microstep.</p>
+
+      <h4 class="stepper-only">Syringe geometry (theoretical flow check)</h4>
+      <div class="grid3 stepper-only">
+        <label class="field">Inner diameter (mm)<input name="syringe.innerDiameter_mm" type="number" step="any"></label>
+        <label class="field">Lead-screw pitch (mm/rev)<input name="syringe.leadscrewPitch_mm" type="number" step="any"></label>
+        <div class="field"><span class="label">Theoretical</span><div id="theory" class="mono strong">—</div></div>
+      </div>
+
+      <h4>Closed-loop control</h4>
+      <div class="grid3">
+        <label class="field">Kp (–)<input name="pid.kp" type="number" step="any"></label>
+        <label class="field">Ki (1/s)<input name="pid.ki" type="number" step="any"></label>
+        <label class="field">Kd (s)<input name="pid.kd" type="number" step="any"></label>
+        <label class="field">Loop rate (Hz)<input name="pid.loopHz" type="number" step="any" min="0.2" max="10"></label>
+        <label class="field">Averaging window (s)<input name="pid.filterWindowS" type="number" step="any" min="0.5" max="900"></label>
+        <label class="field">Filter
+          <select name="pid.filter"><option value="ma">moving average</option><option value="ema">EMA</option></select>
+        </label>
+        <label class="field">Output limit (% of setpoint)<input name="pid.outputLimitPct" type="number" step="any"></label>
+        <label class="field">Integral limit (% of setpoint)<input name="pid.integralLimitPct" type="number" step="any"></label>
+      </div>
+      <p class="hint">The PID corrects in flow units through the calibration inverse, so Kp is dimensionless and Ki is per second. Defaults Kp 0.3, Ki 0.05 suit most pumps. <span class="pulsatile-hint">Pulsatile (diaphragm) pumps: set the averaging window to several pump cycles (≥ 20 s at low speed).</span></p>
+
+      <h4>Calibrations</h4>
+      <div id="calList2" class="cal-list"></div>
+
+      <div class="row wrap sticky-actions">
+        <button type="submit" class="btn primary">Save profile</button>
+        <button type="button" id="pumpCancel" class="btn">Cancel</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ============================ SETTINGS ============================ -->
+  <section id="tab-settings" class="tab">
+    <div class="panel">
+      <h3>Hardware: drivers &amp; pins</h3>
+      <p class="hint">Changes apply without recompiling once all channels are stopped. Illegal pins (flash 6-11, strapping 0/2/5/12/15, UART 1/3, input-only 34-39) and conflicts are rejected. A ULN2003 board can only drive a <em>unipolar</em> stepper (28BYJ-48); NEMA17 needs a STEP/DIR driver.</p>
+      <div id="hwForms" class="hw-forms"></div>
+      <div id="hwErrors" class="errors"></div>
+      <button id="hwApply" class="btn primary">Apply hardware</button>
+    </div>
+
+    <div class="panel">
+      <h3>General</h3>
+      <div class="grid3">
+        <label class="field">Flow units
+          <select id="setUnit"><option value="uL/min">µL/min</option><option value="mL/min">mL/min</option></select>
+        </label>
+        <label class="field">Watchdog timeout (s)<input id="setWd" type="number" min="2" max="600" step="any"></label>
+        <label class="field">Telemetry rate (Hz)<input id="setTel" type="number" min="0.5" max="20" step="any"></label>
+        <label class="field">Pressure units
+          <select id="setPUnit"><option>kPa</option><option>psi</option><option>mmHg</option><option>cmH2O</option></select>
+        </label>
+        <label class="field">On sensor fault / air-in-line / occlusion
+          <select id="setFault"><option value="pause">pause run + alarm</option><option value="stop">stop run + alarm</option></select>
+        </label>
+      </div>
+      <button id="setSave" class="btn primary">Save</button>
+      <p class="hint">The watchdog stops runs when no browser has sent a heartbeat for this long, unless the run was started with “Keep running if disconnected”. Sensor FAULT, air-in-line and E-STOP still apply.</p>
+    </div>
+
+    <div class="panel">
+      <h3>Wi-Fi</h3>
+      <div id="wifiStatus" class="mono small"></div>
+      <div class="grid3">
+        <label class="field">Join network (SSID)<input id="wifiSsid" type="text" autocomplete="off"></label>
+        <label class="field">Password<input id="wifiPass" type="password" autocomplete="new-password" placeholder="(unchanged)" form="wifiForm"></label>
+        <label class="field">Access-point password<input id="apPass" type="password" autocomplete="new-password" placeholder="(unchanged, ≥ 8 chars)" form="wifiForm"></label>
+      </div>
+      <form id="wifiForm" onsubmit="return false"></form>
+      <button id="wifiSave" class="btn primary">Save Wi-Fi</button>
+      <p class="hint">The ESP32 access point is always on (192.168.4.1). Campus Wi-Fi often blocks mDNS, isolates clients or needs WPA2-Enterprise; use the AP or a phone hotspot. The AP handles about 4 clients.</p>
+    </div>
+
+    <div class="panel">
+      <h3>Time &amp; system</h3>
+      <div id="timeStatus" class="mono small"></div>
+      <div class="row wrap">
+        <button id="timeSync" class="btn">Sync time from this device</button>
+        <button id="reboot" class="btn danger">Reboot ESP32</button>
+      </div>
+    </div>
+
+    <div class="panel" id="simPanel" hidden>
+      <h3>Simulator</h3>
+      <p class="hint">Fault injection for the simulated pumps and sensors.</p>
+      <div class="row wrap">
+        <label class="field">Channel<select id="simCh"></select></label>
+        <button id="simBubble" class="btn">Inject 3 s bubble</button>
+        <button id="simFault" class="btn">Toggle sensor fault</button>
+        <button id="simWeaker" class="btn">Pump 20 % weaker</button>
+        <button id="simOcclusion" class="btn">Toggle occlusion</button>
+        <button id="simPFault" class="btn">Toggle pressure-sensor fault</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ DATA ============================ -->
+  <section id="tab-data" class="tab">
+    <div class="panel">
+      <h3>Session log (this browser)</h3>
+      <p id="sessionInfo" class="mono small"></p>
+      <div class="row wrap">
+        <button id="dlSession" class="btn primary">Download session CSV</button>
+        <button id="clearSession" class="btn">Clear session log</button>
+      </div>
+      <p class="hint">Recorded from live telemetry while this tab is open. For unattended multi-hour runs use <code>tools/logger.py</code> on a laptop or Raspberry Pi. The ESP32 itself is not the log of record.</p>
+    </div>
+    <div class="panel">
+      <h3>ESP32 history buffer</h3>
+      <p id="historyInfo" class="mono small"></p>
+      <div class="row wrap">
+        <a id="dlHistory" class="btn" href="/api/log.csv" download="biopump-history.csv">Download ESP32 history CSV</a>
+        <button id="clearHistory" class="btn">Clear ESP32 history</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<button id="estop" class="estop" title="Emergency stop: all motors">E-STOP</button>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<template id="tplChannel">
+  <article class="card channel">
+    <header class="card-head">
+      <div class="ch-title">
+        <span class="ch-num"></span>
+        <select class="ch-profile" title="Pump profile"></select>
+      </div>
+      <div class="pills">
+        <span class="pill state"></span>
+        <span class="pill sensor"></span>
+        <span class="pill psensor p-only"></span>
+      </div>
+    </header>
+    <div class="alarms"></div>
+
+    <div class="readouts">
+      <div class="ro big"><span class="lbl">Flow (avg)</span><span class="val flow"></span><span class="sub noise"></span></div>
+      <div class="ro"><span class="lbl">Instant</span><span class="val flowi"></span></div>
+      <div class="ro"><span class="lbl cmd-lbl">Command</span><span class="val cmd"></span><span class="sub cmdt"></span></div>
+      <div class="ro"><span class="lbl">Temp</span><span class="val temp"></span></div>
+      <div class="ro p-only"><span class="lbl">Pressure (gauge)</span><span class="val pres"></span><span class="sub pres-sub"></span></div>
+      <div class="ro"><span class="lbl">Volume</span><span class="val vol"></span><button class="link vol-reset" title="Reset totalizer">reset</button></div>
+      <div class="ro wide run-only"><span class="lbl">Delivered / planned · target</span><span class="val delivered"></span><span class="sub delivered-sub"></span></div>
+      <div class="ro run-only"><span class="lbl">ETA</span><span class="val eta"></span><span class="sub elapsed"></span></div>
+    </div>
+
+    <div class="control">
+      <div class="seg modes">
+        <button data-mode="manual">Manual</button>
+        <button data-mode="closed_loop">Closed-loop</button>
+        <button data-mode="volume">Volume</button>
+        <button data-mode="open_loop">Open-loop</button>
+        <button data-mode="program">Program</button>
+      </div>
+
+      <div class="mode-panel" data-panel="manual">
+        <div class="setpoint">
+          <button class="btn step" data-delta="-1">−</button>
+          <input class="sp-input m-cmd" type="number" step="any" inputmode="decimal">
+          <span class="unit m-unit"></span>
+          <button class="btn step" data-delta="1">+</button>
+        </div>
+        <input class="m-slider" type="range" step="any">
+        <label class="inline"><input class="m-rev" type="checkbox"> Reverse</label>
+      </div>
+
+      <div class="mode-panel" data-panel="closed_loop">
+        <div class="setpoint">
+          <button class="btn step" data-delta="-1">−</button>
+          <input class="sp-input c-flow" type="number" step="any" inputmode="decimal">
+          <span class="unit flow-unit"></span>
+          <button class="btn step" data-delta="1">+</button>
+        </div>
+        <label class="field nocal">Initial command (no calibration) <input class="c-init" type="number" step="any"></label>
+      </div>
+
+      <div class="mode-panel" data-panel="volume">
+        <div class="grid2">
+          <label class="field">Volume (mL)<input class="v-vol" type="number" step="any" value="15"></label>
+          <label class="field">Duration (h)<input class="v-dur" type="number" step="any" value="4"></label>
+        </div>
+        <div class="presets">
+          <button class="chip" data-v="15" data-h="4">15 mL / 4 h</button>
+          <button class="chip" data-v="1" data-h="1">1 mL / 1 h</button>
+          <button class="chip" data-v="5" data-h="24">5 mL / 24 h</button>
+        </div>
+        <div class="muted v-rate"></div>
+        <label class="inline"><input class="v-ol" type="checkbox"> Open-loop (calibration only, no feedback)</label>
+        <label class="field nocal">Initial command (no calibration) <input class="v-init" type="number" step="any"></label>
+      </div>
+
+      <div class="mode-panel" data-panel="open_loop">
+        <div class="setpoint">
+          <button class="btn step" data-delta="-1">−</button>
+          <input class="sp-input o-flow" type="number" step="any" inputmode="decimal">
+          <span class="unit flow-unit"></span>
+          <button class="btn step" data-delta="1">+</button>
+        </div>
+        <p class="hint">Command from the active calibration's inverse; no feedback.</p>
+      </div>
+
+      <div class="mode-panel" data-panel="program">
+        <table class="table prog">
+          <thead><tr><th>Step</th><th>Kind</th><th>Value</th><th>Duration (s)</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="row wrap">
+          <button class="btn p-add">+ Step</button>
+          <label class="inline"><input class="p-loop" type="checkbox"> Loop</label>
+        </div>
+      </div>
+
+      <div class="row wrap actions">
+        <label class="inline keep"><input class="keep-run" type="checkbox"> Keep running if disconnected</label>
+        <span class="grow"></span>
+        <button class="btn primary go">Start</button>
+        <button class="btn pause">Pause</button>
+        <button class="btn danger stop">Stop</button>
+      </div>
+    </div>
+
+    <div class="plot-head row wrap">
+      <div class="seg win">
+        <button data-win="60">1 min</button>
+        <button data-win="600" class="active">10 min</button>
+        <button data-win="3600">1 h</button>
+        <button data-win="0">All</button>
+      </div>
+      <button class="btn small plot-pause">Pause plot</button>
+    </div>
+    <div class="plot-wrap"><div class="plot"></div></div>
+
+    <details class="sensor-box">
+      <summary>Sensor &amp; zero</summary>
+      <div class="row wrap">
+        <span class="mono small sensor-info"></span>
+      </div>
+      <div class="row wrap">
+        <label class="field">Zero averaging (s)<input class="z-sec" type="number" value="10" min="1" max="600"></label>
+        <button class="btn z-go">Zero / tare now</button>
+        <button class="btn z-clear">Clear offset</button>
+      </div>
+      <p class="hint">Tare with the pump stopped and the line fully wetted and bubble-free. Saline uses the water calibration of the sensor and carries some fluid-dependent error: check the final volume against a collected reference.</p>
+      <div class="p-only">
+        <h4>Pressure sensor (MPRLS, absolute)</h4>
+        <div class="row wrap"><span class="mono small p-info"></span></div>
+        <div class="row wrap">
+          <label class="field">Tare averaging (s)<input class="pz-sec" type="number" value="5" min="1" max="60"></label>
+          <button class="btn pz-go">Tare pressure (line open to air)</button>
+          <button class="btn pz-clear">Clear tare</button>
+        </div>
+        <div class="row wrap">
+          <label class="field">Occlusion alarm above <span class="unit p-unit"></span><input class="pa-val" type="number" step="any" min="0" placeholder="off"></label>
+          <button class="btn pa-set">Set limit</button>
+          <button class="btn pa-off">Turn off</button>
+        </div>
+        <p class="hint">The sensor measures <em>absolute</em> pressure (≈ 1 atm with the line open), so tare it with the pump stopped and the sensor port open to air; the dashboard then shows gauge pressure. Weather and altitude shift the atmosphere by about 1 kPa, so re-tare before each session. When a limit is set, pressure above it for 1 s (or a saturated or faulted sensor) pauses or stops any run, per the “On sensor fault” setting. Accuracy is ±1.5 % of 25 psi (±2.6 kPa ≈ ±19 mmHg): good for occlusion and back-pressure trends, too coarse for absolute CSF pressure.</p>
+      </div>
+    </details>
+  </article>
+</template>
+
+<script src="uplot.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

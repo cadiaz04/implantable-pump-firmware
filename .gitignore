@@ -17,3 +17,7 @@ Thumbs.db
 # Local scratch / logs
 *.log
 /data_logs/
+
+# Python
+__pycache__/
+*.pyc
